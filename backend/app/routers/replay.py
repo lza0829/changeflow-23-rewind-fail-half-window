@@ -20,6 +20,15 @@ def get_replay_task(task_id: int):
     return task
 
 
+@router.get("/replay/tasks/{task_id}/window-proof")
+def get_replay_window_proof(task_id: int):
+    """只读窗完整性证明：窗内已触达 / 窗外未改抽样 / 可恢复游标。"""
+    proof = replay_service.get_window_proof(task_id)
+    if not proof:
+        raise HTTPException(404, "replay task not found")
+    return proof
+
+
 @router.post("/replay/preview")
 def preview_replay(body: ReplayPreviewRequest):
     try:

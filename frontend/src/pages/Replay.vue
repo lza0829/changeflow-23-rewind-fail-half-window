@@ -10,6 +10,9 @@ const failAtSeq = ref(null)
 const preview = ref(null)
 const tasks = ref([])
 const last = ref(null)
+// 窗完整性证明：一律走只读核验接口按 task_id 取，与任务详情同源
+const proof = ref(null)
+const proofErr = ref('')
 const err = ref('')
 const busy = ref(false)
 const autoRefresh = ref(false)
@@ -20,6 +23,30 @@ async function refreshStreams() {
 }
 async function refreshTasks() {
   tasks.value = await getJSON('/api/replay/tasks')
+}
+
+async function loadProof(taskId) {
+  proofErr.value = ''
+  if (taskId === null || taskId === undefined) {
+    proof.value = null
+    return
+  }
+  try {
+    proof.value = await getJSON(`/api/replay/tasks/${taskId}/window-proof`)
+  } catch (e) {
+    proof.value = null
+    proofErr.value = String(e.message || e)
+  }
+}
+
+async function showTask(taskId) {
+  // 点任务行：详情与完整性证明都按 task_id 重新拉取，避免读到别的任务的旧数字
+  await loadProof(taskId)
+  try {
+    last.value = await getJSON(`/api/replay/tasks/${taskId}`)
+  } catch (e) {
+    err.value = String(e.message || e)
+  }
 }
 
 async function doPreview() {
@@ -54,6 +81,7 @@ async function runReplay() {
     }
     if (failAtSeq.value !== null && failAtSeq.value !== '') body.fail_at_seq = Number(failAtSeq.value)
     last.value = await postJSON('/api/replay/tasks', body)
+    await loadProof(last.value.id)
     await Promise.all([refreshTasks(), refreshStreams()])
     if (last.value.status === 'failed') {
       err.value = `任务失败：${last.value.report?.failure?.error || '未知错误'}（游标停在可恢复点 ${last.value.cursor_after}）`
@@ -186,6 +214,89 @@ onUnmounted(() => timer && clearInterval(timer))
         </p>
         <p class="muted">策略：{{ last.report.idempotency_policy }}</p>
       </div>
+
+      <h4>窗完整性证明 #{{ last.id }}</h4>
+      <p v-if="proofErr" class="tag danger">{{ proofErr }}</p>
+      <div v-else-if="!proof || proof.task_id !== last.id" class="muted">加载中…</div>
+      <div v-else-if="!proof.available">
+        <p class="tag warn">无可核验证明</p>
+        <p class="muted">{{ proof.reason }}</p>
+      </div>
+      <div v-else>
+        <p class="muted">
+          窗口 <span class="mono">[{{ proof.window_start }}..{{ proof.window_end_seq }}]</span> ·
+          任务 {{ proof.task_id }} · 证明与任务行同源核对
+          <span :class="proof.matches_task_row ? 'tag ok' : 'tag danger'">
+            {{ proof.matches_task_row ? '一致' : '不一致' }}
+          </span>
+        </p>
+
+        <div class="proof-grid">
+          <div class="proof-card">
+            <div class="proof-label">窗内已触达</div>
+            <div class="hero-num">{{ proof.in_window_touched_keys.length }}</div>
+            <p class="muted">个实体键</p>
+            <p class="mono" v-if="proof.in_window_touched_keys.length">
+              {{ proof.in_window_touched_keys.join('、') }}
+            </p>
+            <table v-if="proof.in_window_touched_events">
+              <thead><tr><th>entity_key</th><th>事件</th></tr></thead>
+              <tbody>
+                <tr v-for="(events, key) in proof.in_window_touched_events" :key="key">
+                  <td>{{ key }}</td>
+                  <td class="mono">
+                    <span v-for="e in events" :key="e.seq">seq{{ e.seq }} {{ e.op }}/{{ e.disposition }} </span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="proof-card">
+            <div class="proof-label">窗外未改</div>
+            <div class="hero-num">{{ proof.out_of_window_key_count }}</div>
+            <p class="muted">
+              个窗外键 ·
+              <span :class="proof.out_of_window_untouched_verified ? 'tag ok' : 'tag danger'">
+                {{ proof.out_of_window_untouched_verified ? '指纹全部一致' : `被改动：${proof.out_of_window_changed_keys.join('、')}` }}
+              </span>
+            </p>
+            <table>
+              <thead><tr><th>entity_key</th><th>任务前载荷指纹</th><th>任务后载荷指纹</th></tr></thead>
+              <tbody>
+                <tr v-for="s in proof.out_of_window_untouched_sample" :key="s.entity_key">
+                  <td>{{ s.entity_key }}</td>
+                  <td class="mono">{{ s.before ? s.before.payload_sha256.slice(0, 12) : '—' }}</td>
+                  <td class="mono">{{ s.after ? s.after.payload_sha256.slice(0, 12) : '—' }}</td>
+                </tr>
+                <tr v-if="!proof.out_of_window_untouched_sample.length">
+                  <td colspan="3" class="muted">无窗外键（窗口覆盖整条流）</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="proof-card">
+            <div class="proof-label">可恢复游标</div>
+            <div class="hero-num">{{ proof.recoverable_cursor }}</div>
+            <p class="muted">
+              任务开始前游标 {{ proof.cursor_before }} · 回拨目标 {{ proof.target_cursor }} → 窗末 {{ proof.window_end_seq }}
+            </p>
+            <p v-if="proof.failure_seq !== null">
+              <span class="tag danger">失败于 seq {{ proof.failure_seq }}</span>
+              半窗未完成，游标停在可恢复点 {{ proof.recoverable_cursor }}，不得当作窗完成。
+            </p>
+            <p v-else>
+              <span class="tag ok">窗内全部成功</span>
+              游标复位到 {{ proof.recoverable_cursor }}。
+            </p>
+            <p :class="proof.window_completed ? 'tag ok' : 'tag warn'">
+              窗完成：{{ proof.window_completed ? '是' : '否（失败/部分处理）' }}
+            </p>
+          </div>
+        </div>
+        <p class="muted">{{ proof.proof_policy }}</p>
+      </div>
     </div>
 
     <div class="panel">
@@ -202,7 +313,8 @@ onUnmounted(() => timer && clearInterval(timer))
           </tr>
         </thead>
         <tbody>
-          <tr v-for="t in tasks" :key="t.id">
+          <tr v-for="t in tasks" :key="t.id" @click="showTask(t.id)"
+              :class="{ selected: last && last.id === t.id }" style="cursor: pointer">
             <td>{{ t.id }}</td>
             <td>{{ t.stream_id }}</td>
             <td><span :class="statusTag(t.status)">{{ t.status }}</span></td>

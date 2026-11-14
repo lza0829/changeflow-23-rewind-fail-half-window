@@ -230,3 +230,141 @@ def test_skip_disposition_for_idempotent_delete_of_missing_key(isolated_db):
     conn = connect()
     assert "ORD-1002" not in _sink_map(conn, 1)
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 「失败却抬到窗末 / 成功越窗外」回归 + 窗完整性证明
+# ---------------------------------------------------------------------------
+
+
+def test_in_window_respects_upper_bound():
+    from app.modules.cursor_rewind_window import in_window, window_seqs
+
+    # 窗 = (1, 4]：seq 2/3/4 在内，seq 5 在窗外
+    assert window_seqs(1, 4) == [2, 3, 4]
+    assert in_window(2, 1, 4) is True
+    assert in_window(4, 1, 4) is True
+    assert in_window(5, 1, 4) is False   # 上界之外不得重放
+    assert in_window(1, 1, 4) is False   # target 本身不在窗内
+
+
+def test_success_does_not_touch_out_of_window_key(isolated_db):
+    """演示前置「先抬游标写入窗外行」：成功重放 [1,4] 后 ORD-1003 必须原样。"""
+    _apply_to_end(1)
+    conn = connect()
+    before = _sink_map(conn, 1)
+    conn.close()
+    assert before["ORD-1003"]["last_seq"] == 5
+
+    task = replay_service.create_and_run_replay(1, 1, 4)
+    assert task["status"] == "succeeded"
+    # 窗内候选只有 2/3/4，seq5 不得被当成窗内事件重放
+    assert task["candidate_count"] == 3
+    assert task["report"]["replayed_count"] == 3
+
+    conn = connect()
+    after = _sink_map(conn, 1)
+    conn.close()
+    for key in ("ORD-1001", "ORD-1003"):
+        assert after[key]["payload"] == before[key]["payload"]
+        assert after[key]["last_seq"] == before[key]["last_seq"]
+
+    proof = task["report"]["window_proof"]
+    assert proof["window_start"] == 2
+    assert proof["window_end_seq"] == 4
+    assert proof["failure_seq"] is None
+    assert proof["window_completed"] is True
+    assert proof["recoverable_cursor"] == 5
+    # 窗外键 ORD-1003 出现在抽样里，任务前/后指纹一致
+    sample_keys = {s["entity_key"] for s in proof["out_of_window_untouched_sample"]}
+    assert "ORD-1003" in sample_keys
+    for s in proof["out_of_window_untouched_sample"]:
+        assert s["before"]["payload_sha256"] == s["after"]["payload_sha256"]
+        assert s["before"]["fingerprint"] == s["after"]["fingerprint"]
+        assert s["unchanged"] is True
+    assert proof["out_of_window_untouched_verified"] is True
+
+
+def test_failure_keeps_recoverable_cursor_below_window_end(isolated_db):
+    """中途失败：任务 failed、游标停在任务开始前可恢复点，绝不抬到窗末。"""
+    _apply_to_end(1)
+    task = replay_service.create_and_run_replay(1, 1, 4, fail_at_seq=3)
+    assert task["status"] == "failed"
+    # cursor_before 为任务开始前游标（HWM 5），recoverable 停在 2
+    assert task["cursor_before"] == 5
+    assert task["cursor_after"] == 2
+    assert task["cursor_after"] != task["window_end_seq"]
+    conn = connect()
+    assert streams_repo.get_stream(conn, 1)["apply_cursor"] == 2
+    # 室外键 ORD-1003 依然来自 seq5
+    assert _sink_map(conn, 1)["ORD-1003"]["last_seq"] == 5
+    conn.close()
+
+    proof = task["report"]["window_proof"]
+    assert proof["window_start"] == 2
+    assert proof["window_end_seq"] == 4
+    assert proof["failure_seq"] == 3
+    assert proof["recoverable_cursor"] == 2
+    # 半窗脏写不得说成窗完成
+    assert proof["window_completed"] is False
+    assert proof["window_inside_clean"] is False
+    assert task["report"]["window_completed"] is False
+    # 窗内已触达的键：seq2 的 ORD-1001 + 失败的 ORD-1002
+    assert proof["in_window_touched_keys"] == ["ORD-1001", "ORD-1002"]
+    # 窗外未改抽样仍有内容且一致
+    assert proof["out_of_window_untouched_sample"]
+    assert proof["out_of_window_untouched_verified"] is True
+
+
+def test_window_proof_persisted_and_read_only_endpoint_matches_task(isolated_db):
+    _apply_to_end(1)
+    failed = replay_service.create_and_run_replay(1, 1, 4, fail_at_seq=3)
+    ok = replay_service.create_and_run_replay(1, 2, 4)
+    assert failed["status"] == "failed"
+    assert ok["status"] == "succeeded"
+
+    for task in (failed, ok):
+        proof = replay_service.get_window_proof(task["id"])
+        assert proof is not None and proof["available"] is True
+        assert proof["task_id"] == task["id"]
+        assert proof["matches_task_row"] is True
+        assert proof["task_status"] == task["status"]
+        assert proof["window_start"] == task["target_cursor"] + 1
+        assert proof["window_end_seq"] == task["window_end_seq"]
+        assert proof["recoverable_cursor"] == task["cursor_after"]
+        # 接口与任务详情（report.window_proof）同源：数字完全一致
+        assert proof == {**task["report"]["window_proof"], "available": True,
+                         "task_status": task["status"],
+                         "cursor_after_task_row": task["cursor_after"],
+                         "matches_task_row": True}
+        # 窗外未改抽样至少 1 个窗外键
+        assert len(proof["out_of_window_untouched_sample"]) >= 1
+
+    assert replay_service.get_window_proof(99999) is None
+
+
+def test_window_proof_survives_reopen(isolated_db):
+    """证明落库在 replay_tasks.window_proof_json，刷新/重连后仍可核验。"""
+    _apply_to_end(1)
+    task = replay_service.create_and_run_replay(1, 1, 4, fail_at_seq=3)
+    proof_first = replay_service.get_window_proof(task["id"])
+    proof_second = replay_service.get_window_proof(task["id"])
+    assert proof_first == proof_second
+
+
+def test_failure_on_first_window_event_stays_at_target(isolated_db):
+    """第一个窗内事件就失败：游标停在 target_cursor，而不是窗末。"""
+    _apply_to_end(1)
+    task = replay_service.create_and_run_replay(1, 1, 4, fail_at_seq=2)
+    assert task["status"] == "failed"
+    assert task["cursor_after"] == 1
+    assert task["last_processed_seq"] is None
+    proof = task["report"]["window_proof"]
+    assert proof["failure_seq"] == 2
+    assert proof["recoverable_cursor"] == 1
+    assert proof["window_completed"] is False
+    # 失败事件所在键计入“窗内已触达”（它被处理到隔离，但未提交成功）
+    assert proof["in_window_touched_keys"] == ["ORD-1001"]
+    conn = connect()
+    assert streams_repo.get_stream(conn, 1)["apply_cursor"] == 1
+    conn.close()

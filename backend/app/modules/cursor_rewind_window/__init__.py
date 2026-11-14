@@ -25,8 +25,9 @@
                                    ──窗内逐 seq 推进──> last_processed_seq
                                    ──全窗成功后复位──> cursor_before(=HWM)
 
-   中途失败则游标停在最后一个成功处理的 seq（recover_point，可恢复点），任务标
-   ``failed``，绝不允许半窗脏数据却显示成功。
+   中途失败则游标停在**任务开始前的可恢复点**（``recoverable_cursor``：窗内一个事件
+   都没成功时就是 ``target_cursor``，否则是最后一个已确认 seq），任务标 ``failed``，
+   绝不允许半窗脏数据却显示成功，也绝不把游标抬到 ``window_end_seq``。
 
 幂等 / 覆盖策略
 ---------------
@@ -49,9 +50,11 @@
 ``last_processed_seq`` 与流游标始终一致。失败时：
 
 * 出错事件进隔离区（disposition=replay_quarantined，reason 含异常信息）；
-* 流游标停在 last_processed_seq（一个已确认的 seq，而非悬空位置）；
-* 任务 status=failed，报告给出 recover_point 与“如何恢复”：修复后新建一个
-  ``[recover_point, window_end_seq]`` 的重放任务，成功后游标复位到原 HWM。
+* 流游标停在可恢复点（``last_processed_seq``；一个事件都没成功则为 ``target_cursor``），
+  是一个已确认的 seq 而非悬空位置，且不得抬到窗末；
+* 任务 status=failed，窗完整性证明 ``window_completed=false``，报告给出
+  recover_point 与“如何恢复”：修复后新建一个 ``[recover_point, window_end_seq]``
+  的重放任务，成功后游标复位到原 HWM。
 """
 
 from __future__ import annotations
@@ -70,7 +73,13 @@ def window_seqs(target_cursor: int, window_end_seq: int) -> list[int]:
 
 
 def in_window(seq: int, target_cursor: int, window_end_seq: int) -> bool:
-    return int(target_cursor) < int(seq)
+    """``seq`` 是否落在回拨窗 ``(target_cursor, window_end_seq]`` 内。
+
+    上界必须参与判定：只判下界会让 ``seq > window_end_seq`` 的窗外事件也被重放，
+    把窗外实体行从高 seq 状态覆盖回旧状态（“成功越窗外”回归）。
+    """
+    seq = int(seq)
+    return int(target_cursor) < seq <= int(window_end_seq)
 
 
 def validate_window(

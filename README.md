@@ -62,20 +62,44 @@ cd frontend && npm install && npm run dev
    - `delete` 幂等，键已不存在记 `replay_skipped`（无副作用）；
    - `applied_seqs` 用 `INSERT OR IGNORE`，重放不增不减；账本只追加
      （`kind='replay'`，disposition 为 replayed / replay_skipped / replay_quarantined）。
-3. 中途失败：出错事件进隔离区，任务标 `failed`，游标停在最后一个已确认 seq
-   （文档化的可恢复点 recover_point），绝无半窗脏数据却显示成功。修复后按报告里的
-   recovery_hint 新建 `[recover_point, window_end_seq]` 任务即可续放，成功后游标复位高水位。
+3. 中途失败：出错事件进隔离区，任务标 `failed`，游标停在**任务开始前的可恢复点**
+   （`recoverable_cursor`：一个窗内事件都没成功时即 `target_cursor`，否则是最后一个
+   已确认 seq），绝不抬到 `window_end_seq`，也绝无半窗脏数据却显示成功。修复后按报告
+   里的 recovery_hint 新建 `[recoverable_cursor, window_end_seq]` 任务即可续放，
+   成功后游标复位高水位。
 4. 任务结果写明：回拨前游标、回拨目标、窗内候选数、重放/跳过/隔离计数、最终游标，
    并附带与账本、Sink、applied_seqs、游标页、隔离区的交叉核对
    （`cross_checks_passed`）。任务持久化在 `replay_tasks` 表，刷新页面仍在。
-- 窗外 Sink 行与其他流的数据禁止被任务改动，结束时用窗外快照逐键核对。
+- 窗外 Sink 行与其他流的数据禁止被任务改动，结束时用窗外快照逐键核对。窗内判定严格
+  使用 `(target_cursor, window_end_seq]`，`seq > window_end_seq` 的事件永不重放。
+
+**窗完整性证明（每次任务落一份）**
+
+任务结束时随任务一起落库到 `replay_tasks.window_proof_json`，并可从任务详情与只读接口
+`GET /api/replay/tasks/{task_id}/window-proof` 读取（`available=false` 表示历史任务没有证明）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `window_start` / `window_end_seq` | 本次重放窗边界（`window_start = target_cursor + 1`，含上界） |
+| `failure_seq` | 失败时出错事件的 seq；成功为 `null` |
+| `recoverable_cursor` | 任务结束后的可恢复游标：成功=复位到高水位，失败=停在可恢复点 |
+| `window_completed` | 本次是否真的跑完整窗；失败恒为 `false`（半窗绝不称完成） |
+| `in_window_touched_keys` | 窗内实际处理过的实体键（含被隔离的失败事件）及逐事件处置 |
+| `out_of_window_untouched_sample` | 至少 1 个窗外键的**任务前/后载荷指纹**（`payload_sha256` + 整行 `fingerprint`） |
+
+接口还回填 `matches_task_row`，把证明与任务行（`status` / `cursor_after` / 窗边界）逐项比对。
+Replay 页在任务详情展示「窗内已触达 / 窗外未改 / 可恢复游标」三块，数字全部来自该只读接口，
+与接口同源；点击任务列表任一行即可按 `task_id` 重新拉取，失败与成功各跑一轮时两处数字一致。
 
 **演示路径（本地夹具即可）**
 
-1. 应用台对 Orders CDC 正常 Apply，游标 0 → 5；
+1. 应用台对 Orders CDC 正常 Apply，游标 0 → 5（seq5 写入窗外行 `ORD-1003`）；
 2. 回拨重放窗发起 `target_cursor=1, window_end_seq=4`（重放 seq 2/3/4），预览确认候选后执行；
-3. 任务成功、游标复位 5，Sink 与重放前逐行一致、applied_seqs 仍为 1..5、交叉核对全通过；
-4. 可选：填 `fail_at_seq=3` 再发起一次，观察 failed、recover_point=2 与恢复任务。
+3. 任务成功、游标复位 5，Sink 与重放前逐行一致（`ORD-1003` 的 `last_seq` 仍为 5）、
+   applied_seqs 仍为 1..5、交叉核对全通过，证明里 `ORD-1003` 前/后指纹一致；
+4. 再填 `fail_at_seq=3` 发起一次：观察 failed、`recoverable_cursor=2`、`window_completed=false`，
+   游标页停在 2（不是窗末 4），证明的「窗内已触达」含 `ORD-1001`/`ORD-1002`；
+5. 按 recovery_hint 以 `target_cursor=2, window_end_seq=4` 续放，成功后游标复位 5。
 
 ## 技术栈
 

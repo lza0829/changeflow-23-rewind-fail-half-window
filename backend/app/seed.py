@@ -35,6 +35,19 @@ def _migrate_change_ledger_kind(conn) -> None:
     )
 
 
+def _migrate_replay_tasks_window_proof(conn) -> None:
+    """旧库 replay_tasks 补 window_proof_json 列（窗完整性证明）。
+
+    纯加列不需要重建表；历史任务该列为 NULL，只读核验接口会明确回 ``not_available``
+    而不是伪造一份证明。
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(replay_tasks)").fetchall()}
+    if "window_proof_json" in cols:
+        return
+    conn.execute("ALTER TABLE replay_tasks ADD COLUMN window_proof_json TEXT")
+    conn.commit()
+
+
 def init_db():
     conn = connect()
     conn.executescript(
@@ -120,12 +133,14 @@ def init_db():
             last_processed_seq INTEGER,
             fail_at_seq INTEGER,
             report_json TEXT NOT NULL DEFAULT '{}',
+            window_proof_json TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
         """
     )
     _migrate_change_ledger_kind(conn)
+    _migrate_replay_tasks_window_proof(conn)
     if conn.execute("SELECT COUNT(*) c FROM streams").fetchone()["c"] == 0:
         conn.executemany(
             """

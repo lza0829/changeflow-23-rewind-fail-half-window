@@ -8,7 +8,7 @@ from typing import Any
 _COLUMNS = (
     "id, stream_id, status, target_cursor, window_end_seq, cursor_before, cursor_after, "
     "candidate_count, replayed_count, skipped_count, quarantined_count, last_processed_seq, "
-    "fail_at_seq, report_json, created_at, updated_at"
+    "fail_at_seq, report_json, window_proof_json, created_at, updated_at"
 )
 
 
@@ -19,6 +19,7 @@ def _now() -> str:
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     item["report"] = json.loads(item.pop("report_json") or "{}")
+    item["window_proof"] = json.loads(item.pop("window_proof_json") or "null")
     return item
 
 
@@ -38,8 +39,8 @@ def create_task(
         INSERT INTO replay_tasks(
             stream_id, status, target_cursor, window_end_seq, cursor_before, cursor_after,
             candidate_count, replayed_count, skipped_count, quarantined_count,
-            last_processed_seq, fail_at_seq, report_json, created_at, updated_at
-        ) VALUES (?, 'running', ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, '{}', ?, ?)
+            last_processed_seq, fail_at_seq, report_json, window_proof_json, created_at, updated_at
+        ) VALUES (?, 'running', ?, ?, ?, ?, ?, 0, 0, 0, NULL, ?, '{}', NULL, ?, ?)
         """,
         (
             stream_id,
@@ -78,15 +79,28 @@ def update_progress(
 
 
 def finish_task(
-    conn: sqlite3.Connection, task_id: int, *, status: str, cursor_after: int, report: dict[str, Any]
+    conn: sqlite3.Connection,
+    task_id: int,
+    *,
+    status: str,
+    cursor_after: int,
+    report: dict[str, Any],
+    window_proof: dict[str, Any] | None = None,
 ) -> None:
     conn.execute(
         """
         UPDATE replay_tasks
-        SET status=?, cursor_after=?, report_json=?, updated_at=?
+        SET status=?, cursor_after=?, report_json=?, window_proof_json=?, updated_at=?
         WHERE id=?
         """,
-        (status, cursor_after, json.dumps(report, ensure_ascii=False), _now(), task_id),
+        (
+            status,
+            cursor_after,
+            json.dumps(report, ensure_ascii=False),
+            json.dumps(window_proof, ensure_ascii=False) if window_proof is not None else None,
+            _now(),
+            task_id,
+        ),
     )
 
 
